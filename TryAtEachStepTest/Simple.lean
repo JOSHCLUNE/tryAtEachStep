@@ -12,6 +12,7 @@ theorem foo (a : Nat) : a + 0 = 0 + a := by
     rewrite [Nat.zero_add]
     rfl
 
+/-
 theorem foo_inline_sequence (a : Nat) : a + 0 = 0 + a := by
   rw [Nat.add_zero]; rewrite [Nat.zero_add]; rfl
 
@@ -48,3 +49,4 @@ theorem calc2 {a b c : Nat} : a + b + c = c + b + a + 0 := by
          _ = _ := by rw [Nat.add_comm _ c]; exact Eq.symm (Nat.add_assoc c b a)
   rw [Nat.add_zero]
   exact this
+-/

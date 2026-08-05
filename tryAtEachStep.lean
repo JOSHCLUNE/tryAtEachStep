@@ -208,26 +208,17 @@ structure TryTacticResult where
   /-- The original tactic syntax as a string. -/
   oldText : String
 
-  /-- The new tactic syntax as a string. -/
-  newText : String
-
-  /-- The old tactic plus the remaining tactics in the branch, as a string.-/
-  oldToEndOfBranch : String := ""
-
   /-- The name of the declaration that is being elaborated. -/
   parentName : String
 
-  /-- True is the goal is a proposition. -/
+  /-- True if the goal is a proposition. -/
   goalIsProp : Bool
-
-  /-- The original term that resulted from fully elaborating this step. -/
-  oldProof : String
-
-  /-- The new term. -/
-  newProof : String
 
   /-- The number of steps the proof is shortened by. -/
   shortenedStepsCount: Nat := 0
+
+  /-- Whether the tactic succeeded at closing the goal -/
+  tacticSucceeded : Bool
 
   /-- Message logged by the new tactic (e.g. 'try this ...'). -/
   message : Option String
@@ -285,28 +276,30 @@ def tryTactic (config : Config) (tryTacticStx : Syntax) (span : Span) (step : St
      catch _ =>
        return false
   let goalIsProp ← goalIsProp.run' (s := { mctx := mctx })
+  let oldText := s!"{s}"
+  let mkResult (tacticSucceeded : Bool) (message : Option String) : TryTacticResult := {
+    filepath := config.infile.toString
+    parentName := parentName.toString
+    goalIsProp
+    startLine := startPosition.line
+    startCol := startPosition.column
+    oldText
+    tacticSucceeded
+    message
+  }
   let dotac := Term.TermElabM.run' (ctx := {declName? := ci.parentDecl?})
                     <| Tactic.run g (Tactic.evalTactic tryTacticStx)
-  let (mvars, after_state) ← try
+  let (mvars, _after_state) ← try
       dotac.run {} { mctx := mctx }
      catch _e =>
       --println! "caught: {←e.toMessageData.toString}"
-      return none
+      return some (mkResult false none)
   let msgs := (← liftM (m := CoreM) get).messages
   if msgs.hasErrors then
     IO.eprint "X"
-    return none
-  if mvars.length == 0
-  then
-    let (e1, e2) ← match ti.mctxAfter.getExprAssignmentExp g,
-                   after_state.mctx.getExprAssignmentExp g with
-     | some e1, some e2 =>
-        if e1 == e2 then
-          IO.eprint "="
-          return none
-        else
-          pure (e1, e2)
-     | _, _ => return none
+    return some (mkResult false none)
+
+  if mvars.length == 0 then
     IO.eprintln s!"\nline {startPosition.line}, col {startPosition.column}:\n{s}"
     let mut message := ""
     for msg in msgs.toList do
@@ -315,30 +308,10 @@ def tryTactic (config : Config) (tryTacticStx : Syntax) (span : Span) (step : St
     let fewerSteps := 0 < ti.goalsAfter.length
     if fewerSteps then
       IO.eprintln "shortened proof!"
-    let e1' ← stringOfTerm e1 ci.mctx g
-    let e2' ← stringOfTerm e2 after_state.mctx g
 
-    let oldText := s!"{s}"
-    let mut oldToEndOfBranch := oldText
-    if let some seqStx := step.seqStx then
-      if let some tp := seqStx.getTailPos? (canonicalOnly := true) then
-        if tp.1 ≥ span.startPos.1 then
-          oldToEndOfBranch := (Substring.Raw.mk src span.startPos tp).toString
-
-    let result : TryTacticResult := {
-      filepath := config.infile.toString
-      parentName := parentName.toString
-      goalIsProp
-      startLine := startPosition.line
-      startCol := startPosition.column
-      oldText
-      newText := config.tac
-      oldToEndOfBranch
-      oldProof := e1'
-      newProof := e2'
-      message
-    }
-    newResult := result
+    newResult := mkResult true (some message)
+  else
+    newResult := mkResult false none
   let traceState := (← liftM (m := CoreM) get).traceState
   for t in traceState.traces.toList do
     IO.eprintln s!"> {←t.msg.toString}"
@@ -371,6 +344,7 @@ def parseTactic (env : Environment) (str : String) : IO Syntax := do
 def tryTacticAtSteps (config : Config) (tryTacticStx : Syntax) (step_map : StepMap) :
     IO (List TryTacticResult) := do
   let mut resultsDict := Std.HashMap.emptyWithCapacity 300
+  let mut failures : List TryTacticResult := []
   for (span, step) in step_map do
     let seqSpan := if let .some seqStx := step.seqStx
                    then Span.ofSyntax seqStx
@@ -393,8 +367,11 @@ def tryTacticAtSteps (config : Config) (tryTacticStx : Syntax) (step_map : StepM
 
     try
       if let .some res ← tryTactic config tryTacticStx span step then
-         if let .some sp := seqSpan
-         then
+         if !res.tacticSucceeded then
+           -- Failures must not enter `resultsDict`: entries there mark branches as
+           -- already proved, which would skip the remaining steps of the branch.
+           failures := res :: failures
+         else if let .some sp := seqSpan then
            resultsDict := resultsDict.insert sp {res with shortenedStepsCount := 0}
          else
            IO.eprintln "WARNING: no seqSpan; failed to record result"
@@ -402,7 +379,7 @@ def tryTacticAtSteps (config : Config) (tryTacticStx : Syntax) (step_map : StepM
     catch e =>
       IO.eprintln s!"{e}"
 
-  return resultsDict.values
+  return resultsDict.values ++ failures.reverse
 
 
 /--
@@ -447,7 +424,11 @@ unsafe def processFile (config : Config) : IO Unit := do
 
   let results ← tryTacticAtSteps config tryTacticStx (traverseForest steps)
   if let .some outfile := config.outfile then
-    IO.FS.writeFile outfile s!"{Lean.toJson results}\n"
+    let successCount := (results.filter (fun x => x.tacticSucceeded)).length
+    IO.FS.writeFile outfile <|
+      s!"Total number of results: {results.length}\n" ++
+      s!"Total number of successes: {successCount}\n" ++
+      s!"{Lean.toJson results}\n"
   pure ()
 
 def pathOfProbId (probId : String) : IO FilePath := do
