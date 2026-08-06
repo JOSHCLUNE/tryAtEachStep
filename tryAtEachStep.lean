@@ -557,4 +557,12 @@ unsafe def main (args : List String) : IO Unit := do
   if cfg.help then
     IO.eprintln TryAtEachStep.helpMessage
     return
-  TryAtEachStep.processFile cfg
+  -- Exit explicitly instead of returning: after `main` returns, the runtime's
+  -- `lean_finalize_task_manager` waits for all outstanding tasks, so any background
+  -- task leaked by elaboration or by the tried tactic keeps the process alive.
+  try
+    TryAtEachStep.processFile cfg
+    IO.Process.exit 0
+  catch e =>
+    IO.eprintln s!"uncaught exception: {e}"
+    IO.Process.exit 1
