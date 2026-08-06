@@ -80,6 +80,7 @@ structure Config where
   tac : String := "exact?"
   infile : FilePath := "."
   outfile : Option FilePath := .none
+  summaryfile : Option FilePath := .none
   doneIfOutfileAlreadyExists : Bool := false
   additionalImports : List String := []
   additionalDynlibs : List FilePath := []
@@ -461,11 +462,12 @@ unsafe def processFile (config : Config) : IO Unit := do
 
   let results ← tryTacticAtSteps config tryTacticStx (traverseForest steps)
   if let .some outfile := config.outfile then
+    IO.FS.writeFile outfile s!"{Lean.toJson results}\n"
+  if let .some summaryfile := config.summaryfile then
     let successCount := (results.filter (fun x => x.tacticSucceeded)).length
-    IO.FS.writeFile outfile <|
+    IO.FS.writeFile summaryfile <|
       s!"Total number of results: {results.length}\n" ++
-      s!"Total number of successes: {successCount}\n" ++
-      s!"{Lean.toJson results}\n"
+      s!"Total number of successes: {successCount}\n"
   pure ()
 
 def pathOfProbId (probId : String) : IO FilePath := do
@@ -505,6 +507,10 @@ def parseArgs (args : Array String) : IO Config := do
     then
       idx := idx + 1
       cfg := {cfg with outfile := args[idx]!}
+    else if args[idx]! == "--summaryfile"
+    then
+      idx := idx + 1
+      cfg := {cfg with summaryfile := args[idx]!}
     else if args[idx]! == "--done-if-outfile-already-exists"
     then
       idx := idx + 1
@@ -541,6 +547,8 @@ def helpMessage : String :=
 
   Options:
     --outfile OUTFILE                   output JSON file
+    --summaryfile SUMMARYFILE           output file for summary statistics
+                                        (number of successes and total attempts)
     --done-if-outfile-already-exists    exit early if outfile already exists
     --imports IMPORTS                   inject import statements for modules from this comma-separated list
     --load-dynlib PATH                  load a shared library before processing the file
