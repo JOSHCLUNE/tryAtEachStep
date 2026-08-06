@@ -82,6 +82,7 @@ structure Config where
   outfile : Option FilePath := .none
   doneIfOutfileAlreadyExists : Bool := false
   additionalImports : List String := []
+  additionalDynlibs : List FilePath := []
 
 instance : Lean.ToJson String.Pos.Raw where
   toJson x := x.1
@@ -390,6 +391,34 @@ def addImports (input : String) (bodyStart : String.Pos.Raw) (imports : List Str
   let body := String.Pos.Raw.extract input bodyStart input.rawEndPos
   header ++ String.join (imports.map (fun im => s!"import {im}\n")) ++ body
 
+/--
+If we are inside a Lake workspace, ask Lake for the file's setup (via `lake setup-file`, like the
+language server does) and load the dynlibs of precompiled dependencies into this process.
+Without this, tactics backed by FFI code (e.g. `hammer`, whose cvc5 bindings are `@[extern]`
+declarations living in precompiled shared libraries) fail in the interpreter because their
+native implementations were never loaded.
+
+Returns the `ModuleSetup` when Lake provided one; `none` when running outside a Lake workspace.
+-/
+def runLakeSetup (config : Config) (input : String) (header : Elab.HeaderSyntax)
+    (mainModuleName : Name) : IO (Option ModuleSetup) := do
+  let docMeta : Server.DocumentMeta := {
+    uri := System.Uri.pathToUri config.infile
+    mod := mainModuleName
+    version := 0
+    text := FileMap.ofString input
+    dependencyBuildMode := .always
+  }
+  let result ← Server.FileWorker.setupFile docMeta header.toModuleHeader
+    (fun line => IO.eprint line)
+  match result with
+  | .success setup => return some setup
+  | .noLakefile => return none
+  | .importsOutOfDate =>
+    throw $ IO.userError "`lake setup-file` reports imports are out of date; try `lake build` first"
+  | .error msg =>
+    throw $ IO.userError s!"`lake setup-file` failed:\n{msg}"
+
 unsafe def processFile (config : Config) : IO Unit := do
   if let .some outfile := config.outfile then
     if (← outfile.pathExists) ∧ config.doneIfOutfileAlreadyExists then
@@ -397,6 +426,8 @@ unsafe def processFile (config : Config) : IO Unit := do
       return ()
 
   initSearchPath (← findSysroot)
+  for dynlib in config.additionalDynlibs do
+    Lean.loadDynlib dynlib
   let mut input ← IO.FS.readFile config.infile
   unless config.additionalImports.isEmpty do
     let preCtx := Parser.mkInputContext input config.infile.toString
@@ -405,7 +436,12 @@ unsafe def processFile (config : Config) : IO Unit := do
   enableInitializersExecution
   let inputCtx := Parser.mkInputContext input config.infile.toString
   let (header, parserState, messages) ← Parser.parseHeader inputCtx
-  let (env, messages) ← processHeader header {} messages inputCtx
+  let mainModuleName ← moduleNameOfFileName config.infile none
+
+  let setup? ← runLakeSetup config input header mainModuleName
+  let plugins := (setup?.map (·.plugins)).getD #[]
+
+  let (env, messages) ← processHeader header {} messages inputCtx (plugins := plugins)
 
   if messages.hasErrors then
     for msg in messages.toList do
@@ -415,8 +451,9 @@ unsafe def processFile (config : Config) : IO Unit := do
 
   let tryTacticStx ← parseTactic env config.tac
 
-  let env := env.setMainModule (← moduleNameOfFileName config.infile none)
-  let opts : Options := Options.empty.insert `maxHeartbeats (DataValue.ofNat 1000000)
+  let env := env.setMainModule mainModuleName
+  let baseOpts := (setup?.map (·.options.toOptions)).getD {}
+  let opts : Options := baseOpts.insert `maxHeartbeats (DataValue.ofNat 1000000)
   let commandState := { Command.mkState env messages opts with infoState.enabled := true }
 
   let (steps, _frontendState) ← (processCommands.run { inputCtx := inputCtx }).run
@@ -460,6 +497,10 @@ def parseArgs (args : Array String) : IO Config := do
       idx := idx + 1
       let imports := args[idx]!.splitOn ","
       cfg := {cfg with additionalImports := imports}
+    else if args[idx]! == "--load-dynlib"
+    then
+      idx := idx + 1
+      cfg := {cfg with additionalDynlibs := cfg.additionalDynlibs ++ [⟨args[idx]!⟩]}
     else if args[idx]! == "--outfile"
     then
       idx := idx + 1
@@ -502,6 +543,10 @@ def helpMessage : String :=
     --outfile OUTFILE                   output JSON file
     --done-if-outfile-already-exists    exit early if outfile already exists
     --imports IMPORTS                   inject import statements for modules from this comma-separated list
+    --load-dynlib PATH                  load a shared library before processing the file
+                                        (may be repeated); inside a Lake workspace the
+                                        dynlibs reported by `lake setup-file` are loaded
+                                        automatically
 
 "
 

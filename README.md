@@ -32,6 +32,13 @@ $ lake exe tryAtEachStep "exact?" Foo/Bar.lean --outfile /tmp/out.json
 Progress will be displayed via stderr as it happens.
 Upon completion, `/tmp/out.json` will contain JSON describing the results.
 
+When run inside a Lake workspace, `tryAtEachStep` queries `lake setup-file` for the
+input file's setup and loads the reported dynamic libraries into the process.
+This makes tactics that rely on precompiled or FFI-backed dependencies
+(e.g. `hammer`, whose cvc5 bindings are implemented in C++) work out of the box.
+Outside a Lake workspace, shared libraries can be loaded explicitly by passing
+`--load-dynlib PATH` (repeatable).
+
 ### running on all files in a directory
 
 The `tryAtEachStepInDirectory` tool runs `tryAtEachStep` on all `.lean` files
