@@ -191,11 +191,11 @@ where go ctx? seqStx a
     ts.foldl (init := a) (go (i.updateContext? ctx?) newSeqStx)
   | .hole _ => a
 
-def traverseForest (steps : List (Environment × InfoState)) : StepMap := Id.run do
+/-- Collect the tactic steps recorded in the info trees of a single command. -/
+def traverseTrees (env : Environment) (infoState : InfoState) : StepMap := Id.run do
   let mut step_map := StepMap.empty
-  for (env, infoState) in steps do
-    for t in infoState.trees.toList do
-        step_map := InfoTree.foldInfo' (visitInfo env) step_map t
+  for t in infoState.trees.toList do
+    step_map := InfoTree.foldInfo' (visitInfo env) step_map t
   return step_map
 
 /-- The result of trying a new tactic at a tactic step.
@@ -320,16 +320,27 @@ def tryTactic (config : Config) (tryTacticStx : Syntax) (span : Span) (step : St
 
   return newResult
 
-partial def processCommands : Frontend.FrontendM (List (Environment × InfoState)) := do
+/--
+Process the commands of the file one at a time, calling `handleCommand` on
+each command's `InfoState` (paired with the environment from before the
+command) as soon as that command has been elaborated.
+
+Handling each command's info trees immediately — instead of accumulating the
+info trees of the whole file and only acting on them at the end — means that
+at most one command's elaboration data needs to be retained at a time. On
+large files, accumulating everything at once can exhaust memory and cause the
+process to be OOM-killed.
+-/
+partial def processCommands (handleCommand : Environment → InfoState → IO Unit) :
+    Frontend.FrontendM Unit := do
   let env := (←get).commandState.env
   let done ← Frontend.processCommand
   let st := ← get
   let infoState := st.commandState.infoState
   set {st with commandState := {st.commandState with infoState := {}}}
-  if done
-  then return [(env, infoState)]
-  else
-    return (env, infoState) :: (←processCommands)
+  handleCommand env infoState
+  if !done then
+    processCommands handleCommand
 
 def parseTactic (env : Environment) (str : String) : IO Syntax := do
   let inputCtx := Parser.mkInputContext str "<argument>"
@@ -420,6 +431,20 @@ def runLakeSetup (config : Config) (input : String) (header : Elab.HeaderSyntax)
   | .error msg =>
     throw $ IO.userError s!"`lake setup-file` failed:\n{msg}"
 
+/--
+Write `results` as JSON to `outfile` (if provided), and write summary
+statistics to the summary file (if provided).
+-/
+def writeResults (outfile : Option FilePath) (summaryfile : Option FilePath)
+    (results : Array TryTacticResult) : IO Unit := do
+  if let .some outfile := outfile then
+    IO.FS.writeFile outfile s!"{Lean.toJson results}\n"
+  if let .some summaryfile := summaryfile then
+    let successCount := (results.filter (fun x => x.tacticSucceeded)).size
+    IO.FS.writeFile summaryfile <|
+      s!"Total number of results: {results.size}\n" ++
+      s!"Total number of successes: {successCount}\n"
+
 unsafe def processFile (config : Config) : IO Unit := do
   if let .some outfile := config.outfile then
     if (← outfile.pathExists) ∧ config.doneIfOutfileAlreadyExists then
@@ -457,17 +482,28 @@ unsafe def processFile (config : Config) : IO Unit := do
   let opts : Options := baseOpts.insert `maxHeartbeats (DataValue.ofNat 1000000)
   let commandState := { Command.mkState env messages opts with infoState.enabled := true }
 
-  let (steps, _frontendState) ← (processCommands.run { inputCtx := inputCtx }).run
+  -- While the run is in progress, results are flushed to `<outfile>.partial`
+  -- after each command, so that partial results survive if the process dies
+  -- before finishing (e.g. gets OOM-killed). Only a completed run writes
+  -- `outfile` itself, which keeps `--done-if-outfile-already-exists` sound.
+  let partialFile := config.outfile.map (·.addExtension "partial")
+  let resultsRef ← IO.mkRef (#[] : Array TryTacticResult)
+  let handleCommand (env : Environment) (infoState : InfoState) : IO Unit := do
+    let stepMap := traverseTrees env infoState
+    if stepMap.isEmpty then return ()
+    let newResults ← tryTacticAtSteps config tryTacticStx stepMap
+    if newResults.isEmpty then return ()
+    let results := (← resultsRef.get) ++ newResults.toArray
+    resultsRef.set results
+    writeResults partialFile config.summaryfile results
+
+  let ((), _frontendState) ← ((processCommands handleCommand).run { inputCtx := inputCtx }).run
     { commandState := commandState, parserState := parserState, cmdPos := parserState.pos }
 
-  let results ← tryTacticAtSteps config tryTacticStx (traverseForest steps)
-  if let .some outfile := config.outfile then
-    IO.FS.writeFile outfile s!"{Lean.toJson results}\n"
-  if let .some summaryfile := config.summaryfile then
-    let successCount := (results.filter (fun x => x.tacticSucceeded)).length
-    IO.FS.writeFile summaryfile <|
-      s!"Total number of results: {results.length}\n" ++
-      s!"Total number of successes: {successCount}\n"
+  writeResults config.outfile config.summaryfile (← resultsRef.get)
+  if let .some partialFile := partialFile then
+    if ← partialFile.pathExists then
+      IO.FS.removeFile partialFile
   pure ()
 
 def pathOfProbId (probId : String) : IO FilePath := do
