@@ -479,7 +479,8 @@ unsafe def processFile (config : Config) : IO Unit := do
 
   let env := env.setMainModule mainModuleName
   let baseOpts := (setup?.map (·.options.toOptions)).getD {}
-  let opts : Options := baseOpts.insert `maxHeartbeats (DataValue.ofNat 1000000)
+  -- let opts : Options := baseOpts.insert `maxHeartbeats (DataValue.ofNat 1000000)
+  let opts := baseOpts -- Increasing maxHeartbeats would lead to an unfairly generous evaluation
   let commandState := { Command.mkState env messages opts with infoState.enabled := true }
 
   -- While the run is in progress, results are flushed to `<outfile>.partial`
